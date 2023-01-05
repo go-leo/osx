@@ -1,11 +1,13 @@
 package signalx
 
 import (
+	"context"
 	"os"
 	"os/signal"
-	"sync"
-	"syscall"
 	"time"
+
+	"github.com/go-leo/syncx"
+	"golang.org/x/sync/errgroup"
 )
 
 type SignalHook = map[os.Signal]func()
@@ -16,63 +18,44 @@ type SignalWaiter struct {
 	incomingSignal os.Signal
 	hooks          []func(os.Signal)
 	waitTimeout    time.Duration
-	stopC          chan any
-	locker         sync.RWMutex
 }
 
-func NewSignalWaiter(signals []os.Signal, waitTimeout time.Duration) *SignalWaiter {
+func NewSignalWaiter(signals []os.Signal, waitTimeout time.Duration, hooks ...func(os.Signal)) *SignalWaiter {
 	w := &SignalWaiter{
 		signals:        signals,
 		signalC:        make(chan os.Signal),
 		incomingSignal: nil,
-		hooks:          make([]func(os.Signal), 0),
+		hooks:          hooks,
 		waitTimeout:    waitTimeout,
-		stopC:          make(chan any, 1),
-		locker:         sync.RWMutex{},
 	}
 	signal.Notify(w.signalC, w.signals...)
 	return w
 }
 
-func (w *SignalWaiter) AddHook(f func(os.Signal)) *SignalWaiter {
-	w.locker.Lock()
-	defer w.locker.Unlock()
-	if f == nil {
-		return w
-	}
-	w.hooks = append(w.hooks, f)
-	return w
-}
-
-func (w *SignalWaiter) KillSelf(signum syscall.Signal) error {
-	return syscall.Kill(syscall.Getpid(), signum)
-}
-
-func (w *SignalWaiter) WaitSignals() *SignalWaiter {
+func (w *SignalWaiter) Wait() *SignalWaiter {
+	// 监听一个系统信号
 	w.incomingSignal = <-w.signalC
-	return w
-}
 
-func (w *SignalWaiter) WaitHooksAsyncInvoked() *SignalWaiter {
-	go func(sig os.Signal) {
-		w.locker.RLock()
-		defer w.locker.RUnlock()
-		defer close(w.stopC)
-		for i := range w.hooks {
-			f := w.hooks[len(w.hooks)-1-i]
-			f(sig)
-		}
-	}(w.incomingSignal)
-	return w
-}
+	// 并发调用所有hook
+	errGroup, ctx := errgroup.WithContext(context.Background())
+	for _, hook := range w.hooks {
+		errGroup.Go(func() error {
+			syncx.BraveDo(func() { hook(w.Signal()) }, func(p any) {})
+			return nil
+		})
+	}
+	go func() { _ = errGroup.Wait() }()
 
-func (w *SignalWaiter) WaitUntilTimeout() *SignalWaiter {
+	// 等待退出
 	select {
-	case <-w.stopC:
-		return w
 	case w.incomingSignal = <-w.signalC:
+		// 如果再接收到一个信息就直接退出。
+		return w
+	case <-ctx.Done():
+		// 等待hook执行完毕后退出
 		return w
 	case <-time.After(w.waitTimeout):
+		// 等待超时退出
 		return w
 	}
 }
@@ -82,10 +65,8 @@ func (w *SignalWaiter) Signal() os.Signal {
 }
 
 func (w *SignalWaiter) Err() error {
-	w.locker.RLock()
-	defer w.locker.RUnlock()
-	if w.incomingSignal == nil {
+	if w.Signal() == nil {
 		return nil
 	}
-	return &SignalError{Signal: w.incomingSignal}
+	return &SignalError{Signal: w.Signal()}
 }
